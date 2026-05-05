@@ -32,23 +32,20 @@ DB_NAME = os.getenv("DB_NAME", "psu_academic")
 DB_USER = os.getenv("DB_USER", "admin")
 DB_PASS = os.getenv("DB_PASSWORD", "psu2024")
 
-# ── Admin credentials (set via env vars for production) ───────────────────────
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "psu2024")
-
 INPUT_DIR = os.getenv("INPUT_DIR", "/app/input")
 
 CAMPUS_OPTIONS  = ["HatYai", "Pattani", "Phuket", "Trang", "Suratthani"]
 FACULTY_OPTIONS = ["ไม่มี (Normal)", "BBA", "Dent", "Med"]
 HOL_TYPES = [
+    "วันหยุดราชการพิเศษ",
+    "วันหยุดชดเชย",
     "วันหยุดอิสลาม (ปัตตานี)",
     "วันหยุดเฉพาะวิทยาเขต",
-    "วันงดการเรียนการสอน",
-    "อื่นๆ (ไม่ใช่วันหยุดราชการ)",
+    "อื่นๆ",
 ]
 
 # ── DB ────────────────────────────────────────────────────────────────────────
-@st.cache_resource
+@st.cache_resource(ttl=0)
 def get_engine():
     return create_engine(
         f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
@@ -985,240 +982,12 @@ def _show_conflict_ui(
             st.rerun()
 
 
-# ── Data Management helpers ───────────────────────────────────────────────────
-
-def _count_and_fetch_for_delete(
-    year_be: int,
-    campus_code: Optional[str],
-    semester: Optional[int],
-    date_from: Optional[date] = None,
-    date_to:   Optional[date] = None,
-) -> tuple[int, pd.DataFrame]:
-    """Return (count, DataFrame) of rows matching delete filters. Includes _fact_id."""
-    engine = get_engine()
-    where = "WHERE f.academic_year = :year"
-    params: dict = {"year": year_be}
-    if campus_code:
-        where += " AND dc.campus_code = :campus"
-        params["campus"] = campus_code
-    if semester is not None:
-        where += " AND f.semester = :sem"
-        params["sem"] = semester
-    if date_from is not None:
-        where += " AND dd.date_actual >= :date_from"
-        params["date_from"] = date_from
-    if date_to is not None:
-        where += " AND dd.date_actual <= :date_to"
-        params["date_to"] = date_to
-    df = pd.read_sql(text(f"""
-        SELECT
-            f.id            AS _fact_id,
-            dd.date_actual  AS วันที่,
-            dc.campus_code  AS วิทยาเขต,
-            df.faculty_code AS คณะ,
-            f.academic_year AS ปีการศึกษา,
-            f.semester      AS ภาคเรียน,
-            f.is_academic_day,
-            f.is_holiday,
-            f.holiday_name  AS ชื่อวันหยุด,
-            f.day_type      AS ประเภทวัน,
-            f.source        AS แหล่งข้อมูล
-        FROM fact_academic_calendar f
-        JOIN dim_date    dd ON f.date_id    = dd.id
-        JOIN dim_campus  dc ON f.campus_id  = dc.id
-        JOIN dim_faculty df ON f.faculty_id = df.id
-        {where}
-        ORDER BY dd.date_actual, dc.campus_code, df.faculty_code
-    """), engine, params=params)
-    return len(df), df
-
-
-def _execute_delete(
-    year_be: int,
-    campus_code: Optional[str],
-    semester: Optional[int],
-    date_from: Optional[date] = None,
-    date_to:   Optional[date] = None,
-) -> int:
-    """Delete matching rows from fact_academic_calendar. Returns rows deleted."""
-    conn = _db_conn()
-    try:
-        cur = conn.cursor()
-        campus_id: Optional[int] = None
-        if campus_code:
-            cur.execute(
-                "SELECT id FROM dim_campus WHERE campus_code = %s", (campus_code,)
-            )
-            r = cur.fetchone()
-            campus_id = r[0] if r else None
-
-        conditions = ["f.academic_year = %s"]
-        params: list = [year_be]
-        if campus_id is not None:
-            conditions.append("f.campus_id = %s")
-            params.append(campus_id)
-        if semester is not None:
-            conditions.append("f.semester = %s")
-            params.append(semester)
-        if date_from is not None or date_to is not None:
-            conditions.append(
-                "f.date_id IN (SELECT id FROM dim_date WHERE date_actual BETWEEN %s AND %s)"
-            )
-            params.append(date_from or date(1900, 1, 1))
-            params.append(date_to   or date(9999, 12, 31))
-
-        cur.execute(
-            f"DELETE FROM fact_academic_calendar f WHERE {' AND '.join(conditions)}",
-            params,
-        )
-        deleted = cur.rowcount
-        conn.commit()
-        return deleted
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
-def _delete_rows_by_ids(fact_ids: list) -> int:
-    """Delete specific rows from fact_academic_calendar by id list."""
-    if not fact_ids:
-        return 0
-    conn = _db_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "DELETE FROM fact_academic_calendar WHERE id = ANY(%s)",
-            (fact_ids,)
-        )
-        deleted = cur.rowcount
-        conn.commit()
-        return deleted
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
-# ── Edit helpers ─────────────────────────────────────────────────────────────
-
-def _fetch_for_edit(
-    year_be: int,
-    campus_code: Optional[str],
-    semester: Optional[int],
-) -> pd.DataFrame:
-    """Fetch rows for inline editing (max 1000). Returns DataFrame with _fact_id column."""
-    engine = get_engine()
-    where  = "WHERE f.academic_year = :year"
-    params: dict = {"year": year_be}
-    if campus_code:
-        where += " AND dc.campus_code = :campus"
-        params["campus"] = campus_code
-    if semester is not None:
-        where += " AND f.semester = :sem"
-        params["sem"] = semester
-    return pd.read_sql(text(f"""
-        SELECT
-            f.id            AS _fact_id,
-            dd.date_actual  AS วันที่,
-            dc.campus_code  AS วิทยาเขต,
-            df.faculty_code AS คณะ,
-            f.academic_year AS ปีการศึกษา,
-            f.semester      AS ภาคเรียน,
-            f.is_academic_day,
-            f.is_holiday,
-            f.holiday_name  AS ชื่อวันหยุด,
-            f.day_type      AS ประเภทวัน,
-            f.source        AS แหล่งข้อมูล
-        FROM fact_academic_calendar f
-        JOIN dim_date    dd ON f.date_id    = dd.id
-        JOIN dim_campus  dc ON f.campus_id  = dc.id
-        JOIN dim_faculty df ON f.faculty_id = df.id
-        {where}
-        ORDER BY dd.date_actual, dc.campus_code, df.faculty_code
-        LIMIT 1000
-    """), engine, params=params)
-
-
-def _execute_update_rows(changed_rows: pd.DataFrame) -> int:
-    """UPDATE changed rows in fact_academic_calendar by id. Returns rows updated."""
-    if changed_rows.empty:
-        return 0
-    conn = _db_conn()
-    updated = 0
-    try:
-        cur = conn.cursor()
-        for _, row in changed_rows.iterrows():
-            fact_id  = int(row["_fact_id"])
-            sem_val  = int(row["ภาคเรียน"]) if pd.notna(row["ภาคเรียน"]) else None
-            hol_raw  = str(row["ชื่อวันหยุด"]).strip() if pd.notna(row["ชื่อวันหยุด"]) else ""
-            hol_name = hol_raw if hol_raw not in ("", "None", "nan") else None
-            cur.execute("""
-                UPDATE fact_academic_calendar
-                SET
-                    semester        = %s,
-                    is_academic_day = %s,
-                    is_holiday      = %s,
-                    holiday_name    = %s,
-                    day_type        = %s,
-                    source          = 'manual'
-                WHERE id = %s
-            """, (
-                sem_val,
-                bool(row["is_academic_day"]),
-                bool(row["is_holiday"]),
-                hol_name,
-                str(row["ประเภทวัน"]),
-                fact_id,
-            ))
-            updated += cur.rowcount
-        conn.commit()
-        return updated
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
 # ── Session state defaults ────────────────────────────────────────────────────
 # Transfer _pending_year into up_year BEFORE widgets render
 if "_pending_year" in st.session_state:
     st.session_state["up_year"] = st.session_state.pop("_pending_year")
 if "_pending_campus" in st.session_state:
     st.session_state.pop("_pending_campus")  # discard — campus is NOT auto-set
-
-# ── Login gate ───────────────────────────────────────────────────────────────
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-
-if not st.session_state.authenticated:
-    st.markdown("---")
-    col_center = st.columns([1, 1.2, 1])[1]
-    with col_center:
-        st.markdown("## 🔐 เข้าสู่ระบบ")
-        st.caption("PSU Academic Calendar Pipeline — Admin Only")
-        with st.form("login_form"):
-            _uname = st.text_input("Username", placeholder="admin")
-            _upass = st.text_input("Password", type="password", placeholder="••••••••")
-            _submit = st.form_submit_button("เข้าสู่ระบบ", use_container_width=True, type="primary")
-            if _submit:
-                if _uname == ADMIN_USERNAME and _upass == ADMIN_PASSWORD:
-                    st.session_state.authenticated = True
-                    st.rerun()
-                else:
-                    st.error("❌ Username หรือ Password ไม่ถูกต้อง")
-    st.stop()
-
-# ── Logout button (sidebar) ───────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown(f"👤 **{ADMIN_USERNAME}**")
-    if st.button("🚪 ออกจากระบบ", use_container_width=True):
-        st.session_state.authenticated = False
-        st.rerun()
-    st.divider()
 
 for _k, _v in {
     "export_df": None, "export_name": "",
@@ -1236,10 +1005,6 @@ for _k, _v in {
     "mc_conflicts": None, "mc_conflict_confirmed": False,
     "hol_list": [], "hol_validated": None, "hol_saved": False,
     "hol_conflicts": None, "hol_conflict_confirmed": False,
-    "mgmt_preview": None, "mgmt_backup": None,
-    "mgmt_confirmed": False, "mgmt_history": [],
-    "mgmt_loaded_df": None, "mgmt_selected_ids": [],
-    "edit_df_original": None, "edit_history": [],
 }.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
@@ -1248,384 +1013,11 @@ for _k, _v in {
 st.title("📅 PSU Academic Calendar Pipeline")
 st.caption("ระบบปฏิทินการศึกษา มหาวิทยาลัยสงขลานครินทร์ · Star Schema")
 
-tab_dash, tab_upload, tab_manual, tab_holiday, tab_mgmt = st.tabs([
-    "📊 Dashboard", "📤 อัปโหลดปฏิทิน", "✏️ กรอกปฏิทิน", "🗓️ เพิ่มวันหยุด", "⚙️ จัดการข้อมูล"
+tab_dash, tab_upload, tab_manual, tab_holiday = st.tabs([
+    "📊 Dashboard", "📤 อัปโหลดปฏิทิน", "✏️ กรอกปฏิทิน", "🗓️ เพิ่มวันหยุด"
 ])
 
 # ══════════════════════════════ DASHBOARD ════════════════════════════════════
-with tab_mgmt:
-    st.header("⚙️ จัดการข้อมูล")
-
-    # ── Year options (shared between delete and edit) ─────────────────────
-    try:
-        _yr_df   = pd.read_sql(
-            "SELECT DISTINCT academic_year FROM fact_academic_calendar ORDER BY academic_year DESC",
-            get_engine(),
-        )
-        _yr_opts = _yr_df["academic_year"].tolist()
-    except Exception:
-        _yr_opts = [2568]
-
-    _mgmt_mode = st.radio(
-        "เลือกโหมด",
-        ["🗑️ ลบข้อมูล", "✏️ แก้ไขข้อมูล"],
-        horizontal=True,
-        label_visibility="collapsed",
-    )
-    st.divider()
-
-    # ══ DELETE ════════════════════════════════════════════════════════════════
-    if _mgmt_mode == "🗑️ ลบข้อมูล":
-        st.caption("เลือก filter → โหลดข้อมูล → ติ๊ก 🗑️ รายแถว หรือกด 'ลบทั้งหมด' เพื่อลบทุกแถวในเงื่อนไข")
-
-        # ── Filters ───────────────────────────────────────────────────────────
-        _col1, _col2, _col3 = st.columns(3)
-        with _col1:
-            mgmt_year = st.selectbox("ปีการศึกษา", _yr_opts, key="mgmt_year")
-        with _col2:
-            mgmt_all_campus = st.checkbox("ทุกวิทยาเขต", value=False, key="mgmt_all_campus")
-            if mgmt_all_campus:
-                mgmt_campus: Optional[str] = None
-                st.caption("เลือก: ทุกวิทยาเขต")
-            else:
-                mgmt_campus = st.selectbox("วิทยาเขต", CAMPUS_OPTIONS, key="mgmt_campus_sel")
-        with _col3:
-            mgmt_all_sem = st.checkbox("ทุกภาคเรียน", value=False, key="mgmt_all_sem")
-            if mgmt_all_sem:
-                mgmt_semester: Optional[int] = None
-                st.caption("เลือก: ทุกภาคเรียน")
-            else:
-                mgmt_semester = st.selectbox("ภาคเรียน", [1, 2, 3], key="mgmt_sem_sel")
-
-        # ── Action buttons ────────────────────────────────────────────────────
-        _campus_lbl = "ทุกวิทยาเขต" if mgmt_all_campus else mgmt_campus
-        _sem_lbl    = "ทุกภาคเรียน" if mgmt_all_sem    else f"เทอม {mgmt_semester}"
-
-        _ba1, _ba2, _ba3 = st.columns([2, 3, 5])
-        with _ba1:
-            _do_load = st.button("📂 โหลดข้อมูล", type="primary", key="mgmt_load_btn")
-        with _ba2:
-            _do_delete_all = st.button(
-                f"🗑️ ลบทั้งหมดในเงื่อนไขนี้",
-                type="secondary",
-                key="mgmt_delete_all_btn",
-            )
-        with _ba3:
-            if st.session_state.mgmt_loaded_df is not None:
-                if st.button("🔄 ล้างและโหลดใหม่", key="mgmt_reload_btn"):
-                    st.session_state.mgmt_loaded_df    = None
-                    st.session_state.mgmt_selected_ids = []
-                    st.rerun()
-
-        # ── Load rows ─────────────────────────────────────────────────────────
-        if _do_load:
-            with st.spinner("กำลังโหลด..."):
-                try:
-                    _cnt, _loaded = _count_and_fetch_for_delete(
-                        int(mgmt_year),
-                        None if mgmt_all_campus else mgmt_campus,
-                        None if mgmt_all_sem    else int(mgmt_semester),
-                    )
-                    _loaded.insert(0, "🗑️ เลือกลบ", False)
-                    st.session_state.mgmt_loaded_df    = _loaded
-                    st.session_state.mgmt_selected_ids = []
-                    st.session_state.mgmt_backup       = None
-                except Exception as _exc:
-                    st.error(f"โหลดไม่สำเร็จ: {_exc}")
-                    st.session_state.mgmt_loaded_df = None
-
-        # ── Delete ALL rows matching filter (without loading table first) ─────
-        if _do_delete_all:
-            with st.spinner("กำลังนับข้อมูล..."):
-                try:
-                    _all_cnt, _all_df = _count_and_fetch_for_delete(
-                        int(mgmt_year),
-                        None if mgmt_all_campus else mgmt_campus,
-                        None if mgmt_all_sem    else int(mgmt_semester),
-                    )
-                    st.session_state.mgmt_preview = (_all_cnt, _all_df)
-                except Exception as _exc:
-                    st.error(f"เกิดข้อผิดพลาด: {_exc}")
-                    st.session_state.mgmt_preview = None
-
-        # ── Delete-all confirmation panel ─────────────────────────────────────
-        if st.session_state.mgmt_preview is not None:
-            _all_cnt, _all_df = st.session_state.mgmt_preview
-            st.divider()
-            if _all_cnt == 0:
-                st.info(f"ไม่พบข้อมูล (ปี {mgmt_year} · {_campus_lbl} · {_sem_lbl})")
-                st.session_state.mgmt_preview = None
-            else:
-                st.error(f"⚠️ กำลังจะลบ **{_all_cnt:,} แถวทั้งหมด** (ปี {mgmt_year} · {_campus_lbl} · {_sem_lbl})")
-                st.dataframe(_all_df.drop(columns=["_fact_id"]).head(50),
-                             use_container_width=True, hide_index=True)
-                if _all_cnt > 50:
-                    st.caption(f"แสดง 50 แถวแรก จากทั้งหมด {_all_cnt:,} แถว")
-
-                # Backup + confirm
-                _bkall_buf = io.BytesIO()
-                _all_df.drop(columns=["_fact_id"]).to_excel(_bkall_buf, index=False)
-                _bkall_name = f"backup_all_{mgmt_year}_{_campus_lbl}_{_sem_lbl}.xlsx"
-                st.download_button(
-                    "📥 ดาวน์โหลด Backup ก่อนลบ (.xlsx)",
-                    data=_bkall_buf.getvalue(),
-                    file_name=_bkall_name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="mgmt_dl_all",
-                )
-                _c1, _c2 = st.columns([3, 7])
-                with _c1:
-                    if st.button(f"✅ ยืนยัน ลบ {_all_cnt:,} แถว", type="primary", key="mgmt_confirm_all_btn"):
-                        with st.spinner("กำลังลบ..."):
-                            try:
-                                _all_ids = _all_df["_fact_id"].tolist()
-                                _deleted = _delete_rows_by_ids(_all_ids)
-                                from datetime import datetime as _dt
-                                st.session_state.mgmt_history.insert(0, {
-                                    "เวลา":        _dt.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                    "ปีการศึกษา": int(mgmt_year),
-                                    "วิทยาเขต":   _campus_lbl,
-                                    "ภาคเรียน":   _sem_lbl,
-                                    "แถวที่ลบ":   _deleted,
-                                    "โหมด":       "ลบทั้งหมด",
-                                })
-                                st.session_state.mgmt_preview    = None
-                                st.session_state.mgmt_loaded_df  = None
-                                st.success(f"✅ ลบสำเร็จ: **{_deleted:,} แถว**")
-                                st.rerun()
-                            except Exception as _exc:
-                                st.error(f"ลบไม่สำเร็จ: {_exc}")
-                with _c2:
-                    if st.button("❌ ยกเลิก", key="mgmt_cancel_all_btn"):
-                        st.session_state.mgmt_preview = None
-                        st.rerun()
-
-        st.divider()
-
-        # ── Table with row-select checkboxes ──────────────────────────────────
-        if st.session_state.mgmt_loaded_df is not None:
-            _load_df = st.session_state.mgmt_loaded_df
-            _total   = len(_load_df)
-
-            if _total == 0:
-                st.info("ไม่พบข้อมูลตามเงื่อนไขที่เลือก")
-            else:
-                st.caption(f"พบ **{_total:,} แถว** — ติ๊กช่อง 🗑️ เพื่อเลือกแถวที่ต้องการลบ")
-
-                _edited_del = st.data_editor(
-                    _load_df.drop(columns=["_fact_id"]),
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "🗑️ เลือกลบ":     st.column_config.CheckboxColumn("🗑️", width="small"),
-                        "วันที่":           st.column_config.DateColumn("วันที่",       disabled=True),
-                        "วิทยาเขต":        st.column_config.TextColumn("วิทยาเขต",     disabled=True),
-                        "คณะ":              st.column_config.TextColumn("คณะ",          disabled=True),
-                        "ปีการศึกษา":      st.column_config.NumberColumn("ปีการศึกษา", disabled=True),
-                        "ภาคเรียน":        st.column_config.NumberColumn("ภาคเรียน",   disabled=True),
-                        "is_academic_day":  st.column_config.CheckboxColumn("วันทำการ", disabled=True),
-                        "is_holiday":       st.column_config.CheckboxColumn("วันหยุด",  disabled=True),
-                        "ชื่อวันหยุด":     st.column_config.TextColumn("ชื่อวันหยุด", disabled=True),
-                        "ประเภทวัน":       st.column_config.TextColumn("ประเภทวัน",   disabled=True),
-                        "แหล่งข้อมูล":     st.column_config.TextColumn("แหล่งข้อมูล",disabled=True),
-                    },
-                    key="mgmt_del_editor",
-                    num_rows="fixed",
-                )
-
-                # ── Detect selected rows ──────────────────────────────────────
-                _sel_mask     = _edited_del["🗑️ เลือกลบ"] == True
-                _sel_idx      = list(_sel_mask[_sel_mask].index)
-                _fact_ids_col = _load_df["_fact_id"].reset_index(drop=True)
-                _selected_ids = [int(_fact_ids_col.iloc[i]) for i in _sel_idx]
-
-                if not _selected_ids:
-                    st.caption("ยังไม่ได้เลือกแถวใด — ติ๊ก 🗑️ ที่แถวที่ต้องการลบ")
-                else:
-                    st.divider()
-                    st.error(f"⚠️ เลือกแล้ว **{len(_selected_ids)} แถว** — ตรวจสอบด้านล่างก่อนยืนยัน")
-                    _sel_preview = _load_df.iloc[_sel_idx].drop(columns=["_fact_id", "🗑️ เลือกลบ"])
-                    st.dataframe(_sel_preview, use_container_width=True, hide_index=True)
-                    st.divider()
-
-                    _bk_buf  = io.BytesIO()
-                    _load_df.iloc[_sel_idx].drop(columns=["🗑️ เลือกลบ"]).to_excel(_bk_buf, index=False)
-                    _bk_name = f"backup_sel_{mgmt_year}_{_campus_lbl}_{_sem_lbl}.xlsx"
-                    st.download_button(
-                        "📥 ดาวน์โหลด Backup แถวที่เลือก (.xlsx)",
-                        data=_bk_buf.getvalue(), file_name=_bk_name,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="mgmt_dl_sel",
-                    )
-                    st.warning("การลบไม่สามารถย้อนกลับได้")
-                    if st.button(f"🗑️ ยืนยันลบ {len(_selected_ids)} แถวที่เลือก",
-                                 type="primary", key="mgmt_confirm_del_btn"):
-                        with st.spinner("กำลังลบ..."):
-                            try:
-                                _deleted = _delete_rows_by_ids(_selected_ids)
-                                from datetime import datetime as _dt
-                                st.session_state.mgmt_history.insert(0, {
-                                    "เวลา":        _dt.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                    "ปีการศึกษา": int(mgmt_year),
-                                    "วิทยาเขต":   _campus_lbl,
-                                    "ภาคเรียน":   _sem_lbl,
-                                    "แถวที่ลบ":   _deleted,
-                                    "โหมด":       "เลือกรายแถว",
-                                })
-                                st.session_state.mgmt_loaded_df    = None
-                                st.session_state.mgmt_selected_ids = []
-                                st.success(f"✅ ลบสำเร็จ: **{_deleted:,} แถว**")
-                                st.rerun()
-                            except Exception as _exc:
-                                st.error(f"ลบไม่สำเร็จ: {_exc}")
-
-        # ── Deletion history ──────────────────────────────────────────────────
-        if st.session_state.mgmt_history:
-            st.divider()
-            st.subheader("📋 ประวัติการลบ (session นี้)")
-            st.dataframe(
-                pd.DataFrame(st.session_state.mgmt_history),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-    # ══ EDIT ══════════════════════════════════════════════════════════════════
-    elif _mgmt_mode == "✏️ แก้ไขข้อมูล":
-        st.caption("กรองข้อมูล → โหลด → แก้ไขตรง cell เหมือน Excel → กดบันทึก")
-        st.subheader("🔍 เลือกข้อมูลที่ต้องการแก้ไข")
-
-        _ecol1, _ecol2, _ecol3 = st.columns(3)
-
-        with _ecol1:
-            edit_year = st.selectbox("ปีการศึกษา", _yr_opts, key="edit_year")
-
-        with _ecol2:
-            edit_all_campus = st.checkbox("ทุกวิทยาเขต", value=False, key="edit_all_campus")
-            if edit_all_campus:
-                edit_campus: Optional[str] = None
-                st.caption("เลือก: ทุกวิทยาเขต")
-            else:
-                edit_campus = st.selectbox("วิทยาเขต", CAMPUS_OPTIONS, key="edit_campus_sel")
-
-        with _ecol3:
-            edit_all_sem = st.checkbox("ทุกภาคเรียน", value=False, key="edit_all_sem")
-            if edit_all_sem:
-                edit_semester: Optional[int] = None
-                st.caption("เลือก: ทุกภาคเรียน")
-            else:
-                edit_semester = st.selectbox("ภาคเรียน", [1, 2, 3], key="edit_sem_sel")
-
-        st.divider()
-
-        if st.button("📂 โหลดข้อมูลเพื่อแก้ไข", type="primary", key="edit_load_btn"):
-            with st.spinner("กำลังโหลดข้อมูล..."):
-                try:
-                    _edf = _fetch_for_edit(
-                        int(edit_year),
-                        None if edit_all_campus else edit_campus,
-                        None if edit_all_sem    else int(edit_semester),
-                    )
-                    st.session_state.edit_df_original = _edf.copy()
-                except Exception as _exc:
-                    st.error(f"โหลดไม่สำเร็จ: {_exc}")
-                    st.session_state.edit_df_original = None
-
-        if st.session_state.edit_df_original is not None:
-            _orig  = st.session_state.edit_df_original
-            _total = len(_orig)
-
-            if _total == 0:
-                st.info("ไม่พบข้อมูลตามเงื่อนไขที่เลือก")
-            else:
-                if _total >= 1000:
-                    st.warning(f"⚠️ แสดงสูงสุด 1,000 แถว — กรุณา filter วิทยาเขต/ภาคเรียนให้แคบลง")
-                else:
-                    st.success(f"โหลดสำเร็จ **{_total:,} แถว** — คลิก cell เพื่อแก้ไขได้เลย")
-
-                _DAY_TYPES = ["วันทำการ", "วันหยุด", "วันหยุดนักขัตฤกษ์", "วันสอบ", "ปิดภาค"]
-
-                _edited = st.data_editor(
-                    _orig.drop(columns=["_fact_id"]),
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "วันที่":          st.column_config.DateColumn("วันที่",       disabled=True),
-                        "วิทยาเขต":       st.column_config.TextColumn("วิทยาเขต",     disabled=True),
-                        "คณะ":             st.column_config.TextColumn("คณะ",          disabled=True),
-                        "ปีการศึกษา":     st.column_config.NumberColumn("ปีการศึกษา", disabled=True),
-                        "ภาคเรียน":       st.column_config.NumberColumn(
-                                               "ภาคเรียน", min_value=1, max_value=3, step=1
-                                           ),
-                        "is_academic_day": st.column_config.CheckboxColumn("วันทำการ ✓"),
-                        "is_holiday":      st.column_config.CheckboxColumn("วันหยุด ✓"),
-                        "ชื่อวันหยุด":    st.column_config.TextColumn("ชื่อวันหยุด"),
-                        "ประเภทวัน":      st.column_config.SelectboxColumn(
-                                               "ประเภทวัน", options=_DAY_TYPES
-                                           ),
-                        "แหล่งข้อมูล":    st.column_config.TextColumn("แหล่งข้อมูล", disabled=True),
-                    },
-                    key="edit_data_editor",
-                    num_rows="fixed",
-                )
-
-                # ── Detect changed rows ───────────────────────────────────────
-                _editable_cols = ["ภาคเรียน", "is_academic_day", "is_holiday", "ชื่อวันหยุด", "ประเภทวัน"]
-                _orig_cmp = (
-                    _orig.drop(columns=["_fact_id"])[_editable_cols]
-                    .reset_index(drop=True)
-                    .astype(str)
-                )
-                _edit_cmp = _edited[_editable_cols].reset_index(drop=True).astype(str)
-                _mask        = (_orig_cmp != _edit_cmp).any(axis=1)
-                _changed_idx = list(_mask[_mask].index)
-
-                if _changed_idx:
-                    st.info(f"✏️ แก้ไขแล้ว **{len(_changed_idx)} แถว** — กดบันทึกเพื่อยืนยัน")
-
-                    _sc1, _sc2 = st.columns([2, 8])
-                    with _sc1:
-                        if st.button("💾 บันทึกการแก้ไข", type="primary", key="edit_save_btn"):
-                            # Re-attach _fact_id by index alignment
-                            _fact_ids    = _orig["_fact_id"].reset_index(drop=True)
-                            _changed_df  = _edited.reset_index(drop=True).loc[_changed_idx].copy()
-                            _changed_df["_fact_id"] = _fact_ids.loc[_changed_idx].values
-                            with st.spinner("กำลังบันทึก..."):
-                                try:
-                                    _n_up = _execute_update_rows(_changed_df)
-                                    from datetime import datetime as _dt
-                                    st.session_state.edit_history.insert(0, {
-                                        "เวลา":          _dt.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                        "ปีการศึกษา":   int(edit_year),
-                                        "วิทยาเขต":     "ทุกวิทยาเขต" if edit_all_campus else edit_campus,
-                                        "ภาคเรียน":     "ทุกภาคเรียน" if edit_all_sem    else f"ภาคเรียนที่ {edit_semester}",
-                                        "แถวที่แก้ไข":  _n_up,
-                                    })
-                                    # Reload to reflect saved state
-                                    st.session_state.edit_df_original = _fetch_for_edit(
-                                        int(edit_year),
-                                        None if edit_all_campus else edit_campus,
-                                        None if edit_all_sem    else int(edit_semester),
-                                    ).copy()
-                                    st.success(f"\u2705 \u0e1a\u0e31\u0e19\u0e17\u0e36\u0e01\u0e2a\u0e33\u0e40\u0e23\u0e47\u0e08: **{_n_up} \u0e41\u0e16\u0e27**")
-                                    st.rerun()
-                                except Exception as _exc:
-                                    st.error(f"\u0e1a\u0e31\u0e19\u0e17\u0e36\u0e01\u0e44\u0e21\u0e48\u0e2a\u0e33\u0e40\u0e23\u0e47\u0e08: {_exc}")
-                    with _sc2:
-                        if st.button("\u21a9\ufe0f \u0e22\u0e01\u0e40\u0e25\u0e34\u0e01\u0e41\u0e25\u0e30\u0e42\u0e2b\u0e25\u0e14\u0e43\u0e2b\u0e21\u0e48", key="edit_cancel_btn"):
-                            st.session_state.edit_df_original = None
-                            st.rerun()
-                else:
-                    st.caption("\u0e22\u0e31\u0e07\u0e44\u0e21\u0e48\u0e21\u0e35\u0e01\u0e32\u0e23\u0e41\u0e01\u0e49\u0e44\u0e02 \u2014 \u0e04\u0e25\u0e34\u0e01\u0e17\u0e35\u0e48 cell \u0e43\u0e19\u0e15\u0e32\u0e23\u0e32\u0e07\u0e40\u0e1e\u0e37\u0e48\u0e2d\u0e41\u0e01\u0e49\u0e44\u0e02\u0e44\u0e14\u0e49\u0e40\u0e25\u0e22")
-
-        # \u2500\u2500 Edit history \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-        if st.session_state.edit_history:
-            st.divider()
-            st.subheader("\U0001f4cb \u0e1b\u0e23\u0e30\u0e27\u0e31\u0e15\u0e34\u0e01\u0e32\u0e23\u0e41\u0e01\u0e49\u0e44\u0e02 (session \u0e19\u0e35\u0e49)")
-            st.dataframe(
-                pd.DataFrame(st.session_state.edit_history),
-                use_container_width=True,
-                hide_index=True,
-            )
 with tab_dash:
     try:
         engine = get_engine()
@@ -1880,49 +1272,6 @@ with tab_dash:
         except Exception:
             st.caption("ยังไม่มีข้อมูล multi day_type")
 
-        st.divider()
-
-        # ── Holiday comparison: วันหยุดราชการ vs วันหยุดพิเศษ ม.อ. ─────────────
-        st.subheader("📅 เปรียบเทียบวันหยุด: ราชการ vs พิเศษ ม.อ.")
-        try:
-            _hcdf = pd.read_sql(text("""
-                SELECT
-                    d.date_actual                                                              AS วันที่,
-                    d.day_name                                                                AS วัน,
-                    MAX(CASE WHEN f.source = 'google_calendar' THEN f.holiday_name END)       AS วันหยุดราชการ,
-                    MAX(CASE WHEN f.source = 'manual'          THEN f.holiday_name END)       AS วันหยุดพิเศษ_มอ,
-                    bool_or(f.source = 'google_calendar') AND bool_or(f.source = 'manual')   AS ทับกัน
-                FROM fact_academic_calendar f
-                JOIN dim_date    d  ON f.date_id    = d.id
-                JOIN dim_faculty df ON f.faculty_id = df.id
-                WHERE f.is_holiday = true
-                  AND df.faculty_code = 'Normal'
-                GROUP BY d.date_actual, d.day_name
-                HAVING bool_or(f.source IN ('google_calendar', 'manual'))
-                ORDER BY d.date_actual
-            """), engine)
-
-            if _hcdf.empty:
-                st.caption("ยังไม่มีข้อมูลวันหยุดในระบบ")
-            else:
-                # เพิ่มคอลัมน์สถานะ
-                def _hstatus(row):
-                    if row["ทับกัน"]:
-                        return "⚠️ ทับกัน"
-                    if pd.notna(row["วันหยุดราชการ"]):
-                        return "วันหยุดราชการ"
-                    return "วันหยุดพิเศษ ม.อ."
-                _hcdf["สถานะ"] = _hcdf.apply(_hstatus, axis=1)
-                _overlap_n = int(_hcdf["ทับกัน"].sum())
-                if _overlap_n:
-                    st.warning(f"⚠️ พบ {_overlap_n} วัน ที่วันหยุดราชการทับกับวันหยุดพิเศษ ม.อ.")
-                st.dataframe(
-                    _hcdf[["วันที่", "วัน", "วันหยุดราชการ", "วันหยุดพิเศษ_มอ", "สถานะ"]],
-                    use_container_width=True, hide_index=True,
-                )
-        except Exception:
-            st.caption("ยังไม่มีข้อมูลวันหยุด")
-
     except Exception as e:
         st.error(f"เกิดข้อผิดพลาด: {e}")
         st.info("กรุณาตรวจสอบการเชื่อมต่อ Database หรือรอให้ Pipeline ทำงานเสร็จก่อน")
@@ -2135,7 +1484,7 @@ with tab_holiday:
             else:
                 if st.button("💾 บันทึกลง Database", type="primary", key="hol_save"):
                     _hols_raw = [(d, n, t) for (d, n, t) in st.session_state.hol_list if d]
-                    _cf_hol = _validate_holidays_before_insert(hol_campuses, int(hol_year), int(hol_semester), _hols_raw)
+                    _cf_hol = _validate_holidays_before_insert(hol_campuses, int(hol_year), _hols_raw)
                     if _cf_hol:
                         st.session_state.hol_conflicts = _cf_hol
                         st.rerun()
@@ -2183,6 +1532,9 @@ with tab_upload:
             st.session_state.up_auto_campus = None
             st.session_state.up_auto_year   = None
             st.session_state.up_parse_msg   = None
+
+    if not st.session_state.up_bytes:
+        st.stop()
 
     st.success(
         f"ไฟล์: **{st.session_state.up_fname}**  "
@@ -2242,6 +1594,8 @@ with tab_upload:
         st.rerun()
 
     # ── Step 3 : Review (ทุกภาคเรียน) ──────────────────────────────────────────
+    if st.session_state.up_parsed is None:
+        st.stop()
 
     if st.session_state.get("up_parse_msg"):
         msg_type, msg_text = st.session_state["up_parse_msg"]
@@ -2321,6 +1675,8 @@ with tab_upload:
     # Show conflict popup when background validation found issues
     if st.session_state.get("up_conflicts"):
         _show_conflict_ui(
+            st.session_state.up_conflicts,
+            confirm_key="up_ov_yes", cancel_key="up_ov_no",
             confirmed_flag="up_conflict_confirmed", conflict_flag="up_conflicts",
         )
     _up_should_save = st.session_state.get("up_conflict_confirmed", False)
