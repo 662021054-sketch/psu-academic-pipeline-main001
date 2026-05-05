@@ -1,0 +1,32 @@
+paths:
+  input_dir: "input"
+  output_dir: "output"
+  logs_dir: "logs"
+  # แก้ไข Path สองบรรทัดนี้ให้เป็นชื่อไฟล์ตรงๆ (เพราะอยู่ในโฟลเดอร์ input เดียวกัน)
+  holiday_file: "input/วันหยุด_ม.อ._แยกวิทยาเขต.xlsx"
+  holidays_template: "input/holidays_template.xlsx"
+
+tesseract:
+  cmd: tesseract
+  poppler_path: null
+
+watcher:
+  # แก้ไขจาก /app/input เป็น input
+  watch_folder: "input"
+  cooldown_seconds: 60
+  trigger_patterns:
+    - PATITIN
+    - BBA
+    - DENT
+    - MED
+  python_exe: python
+  # แก้ไข Path ของ script ให้เป็นแบบ Windows
+  script_extract: "scripts/extract.py"
+  script_pipeline: "scripts/pipeline.py"
+  knime_exe: null
+  knime_workflow: null
+
+logging:
+  level: INFO
+  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+  date_format: "%Y-%m-%d %H:%M:%S"

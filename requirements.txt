@@ -1,0 +1,16 @@
+pandas==2.0.3
+python-dotenv==1.0.1
+openpyxl==3.1.2
+ephem==4.1.5
+watchdog==6.0.0
+psycopg2-binary==2.9.9
+pyyaml==6.0.1
+hijridate==2.5.0
+requests==2.31.0
+icalendar==5.0.13
+streamlit==1.32.0
+sqlalchemy==2.0.0
+groq>=0.9.0
+Pillow==10.3.0
+pdfplumber>=0.10.0
+pymupdf>=1.23.0

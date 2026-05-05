@@ -1,0 +1,28 @@
+FROM python:3.9-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+    streamlit==1.32.0 \
+    psycopg2-binary==2.9.9 \
+    pandas==2.0.3 \
+    sqlalchemy==2.0.0 \
+    openpyxl==3.1.2 \
+    Pillow==10.3.0 \
+    groq>=0.9.0 \
+    pdfplumber>=0.10.0 \
+    pymupdf>=1.23.0 \
+    icalendar==5.0.13 \
+    requests==2.31.0 \
+    ephem==4.1.5 \
+    hijridate==2.5.0 \
+    pyyaml==6.0.1 \
+    python-dotenv==1.0.1
+
+COPY admin/ ./admin/
+
+CMD ["streamlit", "run", "admin/app.py", "--server.port=8501", "--server.address=0.0.0.0"]
