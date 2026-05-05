@@ -27,7 +27,6 @@ with open(_CFG_PATH, encoding="utf-8") as _f:
 INPUT_DIR  = _cfg["paths"]["input_dir"]
 OUTPUT_DIR = _cfg["paths"]["output_dir"]
 LOGS_DIR   = _cfg["paths"]["logs_dir"]
-HOL_FILE   = _cfg["paths"]["holiday_file"]
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 Path(LOGS_DIR).mkdir(parents=True, exist_ok=True)
@@ -189,6 +188,16 @@ def _init_schema(cur):
     cur.execute(_DIM_CAMPUS_SQL)
     cur.execute(_DIM_FACULTY_SQL)
     cur.execute(_FACT_SQL)
+    # ล้างข้อมูลวันหยุดเก่าที่มาจาก Excel ออกจาก DB
+    cur.execute("""
+        UPDATE fact_academic_calendar
+        SET is_holiday = false, holiday_name = null, day_type = 'วันทำการ', source = 'pipeline'
+        WHERE source = 'excel'
+           OR holiday_name IN (
+               'วันวาเลนไทน์', 'วันตรุษจีน', 'วันตรุษจีน (วันที่ 2)',
+               'วันตรุษจีน (วันที่ 3)', 'นักขัตฤกษ์'
+           )
+    """)
     _tables_initialized = True
 
 
@@ -665,16 +674,16 @@ def get_islamic_holidays(academic_year: int) -> dict:
 
 
 def load_holidays(sheet_name, academic_year):
-    """โหลดวันหยุดจาก 4 แหล่ง (priority ต่ำ → สูง) และ track source ต่อวัน.
+    """โหลดวันหยุดจาก Google Calendar + ephem เท่านั้น (ไม่ใช้ Excel อีกต่อไป).
 
     Returns:
         hol     : dict[date, str]  — ชื่อวันหยุด
-        sources : dict[date, str]  — แหล่งข้อมูล (google_calendar/ephem/excel/manual)
+        sources : dict[date, str]  — แหล่งข้อมูล (google_calendar/ephem)
     """
     hol:     dict[date, str] = {}
     sources: dict[date, str] = {}
 
-    # 1. Google Calendar: วันหยุดราชการไทย (priority ต่ำสุด)
+    # 1. Google Calendar: วันหยุดราชการไทย (source of truth หลัก)
     for d, name in get_thai_holidays_google(academic_year).items():
         hol[d]     = name
         sources[d] = "google_calendar"
@@ -686,36 +695,12 @@ def load_holidays(sheet_name, academic_year):
                 hol[d]     = name
                 sources[d] = "ephem"
 
-    # 2b. วันหยุดอิสลาม: เฉพาะวิทยาเขตปัตตานี
+    # 3. วันหยุดอิสลาม: เฉพาะวิทยาเขตปัตตานี
     if "ปัตตานี" in sheet_name or sheet_name == "วิทยาเขตปัตตานี":
         for d, name in get_islamic_holidays(academic_year).items():
-            # ไม่ทับวันหยุดที่มีอยู่แล้ว (Google/ephem มี priority ต่ำกว่า Excel)
             if d not in hol:
                 hol[d]     = name
-                sources[d] = "ephem"  # คำนวณจาก hijridate ถือว่าเทียบเท่า ephem
-
-    # 3. Excel ม.อ.: วันหยุดเฉพาะวิทยาเขต (ทับ Google/ephem)
-    df = pd.read_excel(HOL_FILE, sheet_name=sheet_name)
-    df = df[df["ปี พ.ศ."].isin([academic_year, academic_year + 1])].copy()
-    df["วันที่"] = df["วันที่ (พ.ศ.)"].apply(be_to_ce)
-    for _, row in df.iterrows():
-        d                = row["วันที่"]
-        hol[d]     = row["ชื่อวันหยุด"]
-        sources[d] = "excel"
-
-    # 4. holidays_template.xlsx: override มือ (priority สูงสุด)
-    tmpl_path = _cfg["paths"]["holidays_template"]
-    try:
-        tmpl = pd.read_excel(tmpl_path)
-        tmpl = tmpl[tmpl["ปี_พศ"].isin([academic_year, academic_year + 1])].dropna(subset=["วันที่","ชื่อวันหยุด"])
-        if not tmpl.empty:
-            tmpl["วันที่"] = pd.to_datetime(tmpl["วันที่"]).dt.date
-            for _, row in tmpl.iterrows():
-                d          = row["วันที่"]
-                hol[d]     = row["ชื่อวันหยุด"]
-                sources[d] = "manual"
-    except Exception as exc:
-        logger.warning("Could not load holidays_template (%s): %s", tmpl_path, exc)
+                sources[d] = "ephem"
 
     return hol, sources
 
